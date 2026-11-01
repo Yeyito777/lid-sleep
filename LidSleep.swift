@@ -202,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "“No” disables ALL system sleep.", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Battery drains. Keep out of bags.", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Battery drains.", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggles need no password after one-time setup.", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         setupItem = NSMenuItem(title: "Enable password-free toggles…", action: #selector(enableNoPrompt), keyEquivalent: "")

@@ -15,8 +15,8 @@ setting. Dots mean a change is in progress; a question mark means the setting
 could not be read.
 
 > **Important:** Awake mode disables **all system sleep**, not just lid sleep,
-> on both battery and charger. It drains battery. Never put an awake Mac in a
-> bag. Quitting the app does **not** restore sleep.
+> on both battery and charger. It drains battery. Quitting the app does **not**
+> restore sleep.
 
 ## Build and install
 
