@@ -1,5 +1,6 @@
 import AppKit
 import CoreWLAN
+import IOKit.pwr_mgt
 
 func lidIcon(disabled: Bool?, busy: Bool = false) -> NSImage {
     // Vector template artwork stays crisp at Retina resolution and follows
@@ -169,6 +170,32 @@ func runCommand(_ executable: String, _ arguments: [String]) throws {
     }
 }
 
+func shouldHoldDisplayAwake(sleepDisabled: Bool?, keepDisplayOn: Bool, holding: Bool) -> Bool {
+    // An unreadable sleep setting keeps the current choice instead of flickering the display.
+    guard keepDisplayOn else { return false }
+    return sleepDisabled ?? holding
+}
+
+/// Holds a PreventUserIdleDisplaySleep assertion: the display neither dims nor
+/// sleeps, and the screen saver does not start. macOS releases it if the app exits.
+final class DisplayAwakeAssertion {
+    private var id = IOPMAssertionID(0)
+    var isHeld: Bool { id != 0 }
+
+    func set(_ hold: Bool) {
+        if hold && !isHeld {
+            var newID = IOPMAssertionID(0)
+            let result = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                                     IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                     "Lid Sleep: keep display on while awake" as CFString, &newID)
+            if result == kIOReturnSuccess { id = newID } else { NSLog("Could not keep the display on: %d", result) }
+        } else if !hold && isHeld {
+            IOPMAssertionRelease(id)
+            id = 0
+        }
+    }
+}
+
 enum WiFiState: Equatable {
     case missing
     case off
@@ -238,6 +265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private var yesItem: NSMenuItem!
     private var noItem: NSMenuItem!
+    private var displayItem: NSMenuItem!
+    private let displayAwake = DisplayAwakeAssertion()
+    private var keepDisplayOn: Bool { UserDefaults.standard.bool(forKey: "keepDisplayOn") }
     private var setupItem: NSMenuItem!
     private var wifiItem: NSMenuItem!
     private var wifiStatusItem: NSMenuItem!
@@ -275,6 +305,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.target = self
             menu.addItem(item)
         }
+        displayItem = NSMenuItem(title: "Also keep display on", action: #selector(toggleKeepDisplayOn), keyEquivalent: "")
+        displayItem.target = self
+        displayItem.indentationLevel = 1
+        displayItem.toolTip = "While awake, the display never dims, sleeps, or starts the screen saver."
+        menu.addItem(displayItem)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "“No” disables ALL system sleep.", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Battery drains.", action: nil, keyEquivalent: ""))
@@ -299,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.isEnabled = false
         }
         statusItem.menu = menu
+        UserDefaults.standard.register(defaults: ["keepDisplayOn": false])
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -404,15 +440,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         noItem.state = state == true ? .on : .off
         yesItem.isEnabled = !busy
         noItem.isEnabled = !busy
+        displayAwake.set(shouldHoldDisplayAwake(sleepDisabled: busy ? nil : state, keepDisplayOn: keepDisplayOn,
+                                                holding: displayAwake.isHeld))
+        displayItem.state = keepDisplayOn ? .on : .off
         setupItem.isEnabled = !busy
         statusItem.button?.title = ""
         statusItem.button?.image = busy ? busyIcon : (state.map { $0 ? awakeIcon : sleepIcon } ?? unknownIcon)
         let label = busy ? "Lid: changing setting" : (state.map { $0 ? "Lid: Awake" : "Lid: Sleep" } ?? "Lid: unknown setting")
         statusItem.button?.setAccessibilityLabel(label)
         statusItem.button?.toolTip = busy ? "Changing sleep setting…" : state.map {
-            $0 ? "Lid: Awake ☀︎ — sleep on close is off. System sleep is disabled on battery and charger."
+            $0 ? "Lid: Awake ☀︎ — sleep on close is off. System sleep is disabled on battery and charger." +
+                 (displayAwake.isHeld ? " The display stays on." : "")
                : "Lid: Sleep ☾ — sleep on close is on. Normal macOS sleep rules apply, including external-display clamshell mode."
         } ?? "Could not read macOS sleep settings. Click to retry."
+    }
+
+    @objc private func toggleKeepDisplayOn() {
+        UserDefaults.standard.set(!keepDisplayOn, forKey: "keepDisplayOn")
+        refresh()
     }
 
     @objc private func allowSleep() { setDisabled(false) }
@@ -526,8 +571,13 @@ if CommandLine.arguments.contains("--self-test") {
         check(classifyWiFi(interface: "en0", powerOn: true, addressed: ["utun3", "bridge100"]) == .offline)
         check(wifiRetryDelay(restarts: 0) == 20 && wifiRetryDelay(restarts: 1) == 60)
         check(wifiRetryDelay(restarts: 3) == 300 && wifiRetryDelay(restarts: 50) == 300)
+        check(shouldHoldDisplayAwake(sleepDisabled: true, keepDisplayOn: true, holding: false))
+        check(!shouldHoldDisplayAwake(sleepDisabled: false, keepDisplayOn: true, holding: true))
+        check(!shouldHoldDisplayAwake(sleepDisabled: true, keepDisplayOn: false, holding: true))
+        check(shouldHoldDisplayAwake(sleepDisabled: nil, keepDisplayOn: true, holding: true))
+        check(!shouldHoldDisplayAwake(sleepDisabled: nil, keepDisplayOn: true, holding: false))
         check(durationText(59) == "59s" && durationText(125) == "2m" && durationText(3720) == "1h 2m")
-        print("PASS: parsing, noninteractive commands, scoped setup, four distinct template icons, and Wi-Fi checks; no settings changed.")
+        print("PASS: parsing, noninteractive commands, scoped setup, four distinct template icons, display choice, and Wi-Fi checks; no settings changed.")
     } catch {
         fputs("\(error)\n", stderr)
         exit(1)
@@ -535,6 +585,8 @@ if CommandLine.arguments.contains("--self-test") {
 } else if CommandLine.arguments.contains("--status") {
     do {
         print(try readState() ? "Sleep on close: No (system sleep disabled)" : "Sleep on close: Yes (normal macOS rules)")
+        let keep = UserDefaults.standard.object(forKey: "keepDisplayOn") as? Bool ?? false
+        print("Also keep display on: \(keep ? "on (held by the running app while awake)" : "off")")
     } catch {
         fputs("\(error)\n", stderr)
         exit(1)

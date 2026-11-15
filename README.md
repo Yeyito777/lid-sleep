@@ -49,6 +49,10 @@ Items**. An existing LaunchAgent installation continues to work.
 - **Moon / Sleep / Yes:** `/usr/bin/pmset -a disablesleep 0`.
 - Sleep mode restores normal macOS rules; external-display clamshell mode and
   other sleep assertions still apply. It does not force immediate sleep.
+- **Also keep display on** (off by default): while awake, the app holds a
+  standard macOS `PreventUserIdleDisplaySleep` assertion, so the display never
+  dims, sleeps, or starts the screen saver. It needs no password, and macOS drops
+  it when the app quits. Closing a built-in display's lid still turns it off.
 - The app reads the actual system setting at launch, when its menu opens, and
   every 15 seconds. The power setting persists independently of the app.
 
