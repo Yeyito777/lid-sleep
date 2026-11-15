@@ -2,7 +2,8 @@
 
 A tiny native macOS menu-bar app for choosing whether your Mac stays awake
 when you close its lid. Custom vector icons, no Dock icon, no third-party
-dependencies, and no password prompts after one-time setup.
+dependencies, and no password prompts after one-time setup. It can also
+restart Wi-Fi when it drops so macOS rejoins a known network.
 
 | Awake | Sleep |
 | :---: | :---: |
@@ -51,6 +52,30 @@ Items**. An existing LaunchAgent installation continues to work.
 - The app reads the actual system setting at launch, when its menu opens, and
   every 15 seconds. The power setting persists independently of the app.
 
+### Wi-Fi reconnect
+
+**Reconnect Wi-Fi automatically** (on by default) keeps an awake Mac online.
+Every 5 seconds the app checks whether Wi-Fi is on but has no usable IPv4
+address (none, or a self-assigned 169.254 address). After 20 seconds offline it
+turns Wi-Fi off and on, which makes macOS run auto-join across your known
+networks again. While still offline it retries after 1 minute, 2 minutes, then
+every 5 minutes, and it restarts the 20-second grace period after wake.
+
+- Wi-Fi you turned off is left alone, and nothing happens while Ethernet or
+  USB tethering is online.
+- The line under the toggle shows the current state, time offline, and restart
+  count. Restarts are logged:
+  `log show --last 1h --predicate 'process == "LidSleep"' | grep Wi-Fi`.
+- No Location permission, password, or administrator access is used. Apps
+  cannot read Wi-Fi names without Location permission, so macOS still chooses
+  which known network to join.
+- macOS does not auto-join a network you disconnected from manually until you
+  choose it again, so a restart cannot bring that network back.
+- An idle iPhone Personal Hotspot does not broadcast, so no app can see or join
+  it. macOS can wake it over Bluetooth (Instant Hotspot) when the Mac and
+  iPhone share an Apple Account and **System Settings → Wi-Fi → Ask to join
+  hotspots** is **Automatic**.
+
 ### One-time permission
 
 Setup installs `/private/etc/sudoers.d/lidsleep-<uid>` as `root:wheel`, mode
@@ -73,6 +98,7 @@ access, stored password, or third-party dependency.
 APP="$HOME/Applications/Lid Sleep.app/Contents/MacOS/LidSleep"
 
 "$APP" --status                 # Read-only status
+"$APP" --wifi-status            # Read-only Wi-Fi state
 "$APP" --self-test              # Tests; no power settings changed
 "$APP" --enable-no-prompt       # One-time administrator setup
 "$APP" --set sleep              # Restore normal sleep rules

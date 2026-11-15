@@ -30,7 +30,7 @@ cp "$root/Info.plist" "$app/Contents/Info.plist"
 
 swiftc -swift-version 5 -O \
     -target "$(uname -m)-apple-macosx13.0" \
-    -framework AppKit "$root/LidSleep.swift" \
+    -framework AppKit -framework CoreWLAN "$root/LidSleep.swift" \
     -o "$app/Contents/MacOS/LidSleep"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"

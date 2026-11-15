@@ -1,4 +1,5 @@
 import AppKit
+import CoreWLAN
 
 func lidIcon(disabled: Bool?, busy: Bool = false) -> NSImage {
     // Vector template artwork stays crisp at Retina resolution and follows
@@ -168,16 +169,90 @@ func runCommand(_ executable: String, _ arguments: [String]) throws {
     }
 }
 
+enum WiFiState: Equatable {
+    case missing
+    case off
+    case connected
+    case otherNetwork
+    case offline
+}
+
+func isUsableIPv4(_ address: UInt32) -> Bool {
+    // A self-assigned 169.254/16 address means DHCP failed; 0/8 and 127/8 never route.
+    let first = address >> 24
+    return first != 0 && first != 127 && address >> 16 != 0xA9FE
+}
+
+func classifyWiFi(interface: String?, powerOn: Bool, addressed: Set<String>) -> WiFiState {
+    guard let interface = interface else { return .missing }
+    // Wi-Fi the user turned off is never turned back on.
+    guard powerOn else { return .off }
+    if addressed.contains(interface) { return .connected }
+    // Ethernet adapters and USB tethering are also en* interfaces; VPN tunnels are not.
+    if addressed.contains(where: { $0.hasPrefix("en") }) { return .otherNetwork }
+    return .offline
+}
+
+func addressedInterfaces() -> Set<String> {
+    var names = Set<String>()
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0 else { return names }
+    defer { freeifaddrs(list) }
+    var cursor = list
+    while let entry = cursor?.pointee {
+        cursor = entry.ifa_next
+        guard let address = entry.ifa_addr, address.pointee.sa_family == sa_family_t(AF_INET),
+              entry.ifa_flags & UInt32(IFF_UP) != 0 else { continue }
+        let ipv4 = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+            UInt32(bigEndian: $0.pointee.sin_addr.s_addr)
+        }
+        if isUsableIPv4(ipv4) { names.insert(String(cString: entry.ifa_name)) }
+    }
+    return names
+}
+
+func currentWiFiState() -> (WiFiState, String?) {
+    let wifi = CWWiFiClient.shared().interface()
+    let name = wifi?.interfaceName
+    return (classifyWiFi(interface: name, powerOn: wifi?.powerOn() ?? false, addressed: addressedInterfaces()), name)
+}
+
+func wifiRetryDelay(restarts: Int) -> TimeInterval {
+    // Give macOS auto-join a chance first, then back off to every five minutes.
+    return [20, 60, 120, 300][min(restarts, 3)]
+}
+
+func setWiFiPower(_ name: String, on: Bool) -> Bool {
+    guard let wifi = CWWiFiClient.shared().interface(withName: name) else { return false }
+    do { try wifi.setPower(on) } catch { return false }
+    return wifi.powerOn() == on
+}
+
+func durationText(_ interval: TimeInterval) -> String {
+    let seconds = Int(interval)
+    return seconds < 60 ? "\(seconds)s" : seconds < 3600 ? "\(seconds / 60)m" : "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var yesItem: NSMenuItem!
     private var noItem: NSMenuItem!
     private var setupItem: NSMenuItem!
+    private var wifiItem: NSMenuItem!
+    private var wifiStatusItem: NSMenuItem!
     private var state: Bool?
     private var busy = false
     private var timer: Timer?
+    private var wifiTimer: Timer?
     private var authorizationProcess: Process?
+    private var wifiState = WiFiState.missing
+    private var wifiOfflineSince: Date?
+    private var wifiLastRestart: Date?
+    private var wifiRestarts = 0
+    private var wifiRestarting = false
+    private var wifiPowerPending = false
+    private var reconnectWiFi: Bool { UserDefaults.standard.bool(forKey: "reconnectWiFi") }
     private let awakeIcon = lidIcon(disabled: true)
     private let sleepIcon = lidIcon(disabled: false)
     private let unknownIcon = lidIcon(disabled: nil)
@@ -205,6 +280,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Battery drains.", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Toggles need no password after one-time setup.", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
+        wifiItem = NSMenuItem(title: "Reconnect Wi-Fi automatically", action: #selector(toggleWiFiReconnect), keyEquivalent: "")
+        wifiItem.target = self
+        menu.addItem(wifiItem)
+        wifiStatusItem = NSMenuItem(title: "Wi-Fi: checking…", action: nil, keyEquivalent: "")
+        menu.addItem(wifiStatusItem)
+        menu.addItem(NSMenuItem(title: "Restarts Wi-Fi so macOS rejoins a known network.", action: nil, keyEquivalent: ""))
+        menu.addItem(.separator())
         setupItem = NSMenuItem(title: "Enable password-free toggles…", action: #selector(enableNoPrompt), keyEquivalent: "")
         setupItem.target = self
         menu.addItem(setupItem)
@@ -221,9 +303,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        UserDefaults.standard.register(defaults: ["reconnectWiFi": true])
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake),
+                                                          name: NSWorkspace.didWakeNotification, object: nil)
+        checkWiFi()
+        wifiTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.checkWiFi()
+        }
     }
 
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+        checkWiFi()
+    }
+
+    private func checkWiFi() {
+        // While restarting, our own power-off must not read as the user turning Wi-Fi off.
+        guard !wifiRestarting else { return updateWiFiStatus() }
+        let (current, name) = currentWiFiState()
+        wifiState = current
+        let now = Date()
+        // A power-on that failed after our restart is retried rather than left off.
+        if current == .offline || (current == .off && wifiPowerPending), let name = name {
+            if wifiOfflineSince == nil { wifiOfflineSince = now }
+            if reconnectWiFi, let since = wifiOfflineSince,
+               now.timeIntervalSince(wifiLastRestart ?? since) >= wifiRetryDelay(restarts: wifiRestarts) {
+                restartWiFi(name)
+            }
+        } else {
+            if current == .connected && wifiRestarts > 0 {
+                NSLog("Wi-Fi reconnected after %d restart(s)", wifiRestarts)
+            }
+            wifiOfflineSince = nil
+            wifiLastRestart = nil
+            wifiRestarts = 0
+            wifiPowerPending = false
+        }
+        updateWiFiStatus()
+    }
+
+    private func restartWiFi(_ name: String) {
+        wifiRestarting = true
+        wifiRestarts += 1
+        wifiLastRestart = Date()
+        NSLog("Wi-Fi offline; restarting %@ so macOS rejoins a known network (attempt %d)", name, wifiRestarts)
+        DispatchQueue.global(qos: .utility).async {
+            if setWiFiPower(name, on: false) {
+                Thread.sleep(forTimeInterval: 2)
+            } else {
+                NSLog("Could not turn Wi-Fi off")
+            }
+            var restored = setWiFiPower(name, on: true)
+            for _ in 0..<2 where !restored {
+                Thread.sleep(forTimeInterval: 2)
+                restored = setWiFiPower(name, on: true)
+            }
+            if !restored { NSLog("Could not turn Wi-Fi back on; will retry") }
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.wifiRestarting = false
+                self.wifiPowerPending = !restored
+                self.checkWiFi()
+            }
+        }
+    }
+
+    private func updateWiFiStatus() {
+        wifiItem.state = reconnectWiFi ? .on : .off
+        if wifiRestarting {
+            wifiStatusItem.title = "Wi-Fi: restarting to rejoin a network…"
+            return
+        }
+        switch wifiState {
+        case .missing: wifiStatusItem.title = "Wi-Fi: no Wi-Fi hardware found"
+        case .off: wifiStatusItem.title = wifiPowerPending ? "Wi-Fi: could not turn back on; retrying" : "Wi-Fi: turned off — left alone"
+        case .connected: wifiStatusItem.title = "Wi-Fi: connected"
+        case .otherNetwork: wifiStatusItem.title = "Wi-Fi: idle — online through another network"
+        case .offline:
+            let offline = wifiOfflineSince.map { durationText(Date().timeIntervalSince($0)) } ?? "0s"
+            let restarts = wifiRestarts == 0 ? "" : wifiRestarts == 1 ? " — restarted once" : " — restarted \(wifiRestarts)×"
+            wifiStatusItem.title = "Wi-Fi: offline \(offline)" + restarts
+        }
+    }
+
+    @objc private func toggleWiFiReconnect() {
+        UserDefaults.standard.set(!reconnectWiFi, forKey: "reconnectWiFi")
+        checkWiFi()
+    }
+
+    @objc private func didWake() {
+        // macOS rejoins on its own after wake; give it the full grace period again.
+        wifiOfflineSince = nil
+        wifiLastRestart = nil
+        wifiRestarts = 0
+    }
 
     private func refresh() {
         state = try? readState()
@@ -340,7 +513,21 @@ if CommandLine.arguments.contains("--self-test") {
             check(icon.tiffRepresentation != nil)
         }
         check(Set(icons.compactMap { $0.tiffRepresentation }).count == 4)
-        print("PASS: parsing, noninteractive commands, scoped setup, and four distinct template icons; no settings changed.")
+        check(isUsableIPv4(0xC0A8_0102))   // 192.168.1.2
+        check(isUsableIPv4(0xAC14_0A06))   // 172.20.10.6, iPhone hotspot
+        check(isUsableIPv4(0xC000_0002))   // 192.0.0.2, CLAT on IPv6-only Wi-Fi
+        check(!isUsableIPv4(0xA9FE_0102))  // 169.254.1.2, DHCP failed
+        check(!isUsableIPv4(0x7F00_0001))
+        check(!isUsableIPv4(0))
+        check(classifyWiFi(interface: nil, powerOn: true, addressed: ["en0"]) == .missing)
+        check(classifyWiFi(interface: "en0", powerOn: false, addressed: []) == .off)
+        check(classifyWiFi(interface: "en0", powerOn: true, addressed: ["en0", "utun3"]) == .connected)
+        check(classifyWiFi(interface: "en0", powerOn: true, addressed: ["en7"]) == .otherNetwork)
+        check(classifyWiFi(interface: "en0", powerOn: true, addressed: ["utun3", "bridge100"]) == .offline)
+        check(wifiRetryDelay(restarts: 0) == 20 && wifiRetryDelay(restarts: 1) == 60)
+        check(wifiRetryDelay(restarts: 3) == 300 && wifiRetryDelay(restarts: 50) == 300)
+        check(durationText(59) == "59s" && durationText(125) == "2m" && durationText(3720) == "1h 2m")
+        print("PASS: parsing, noninteractive commands, scoped setup, four distinct template icons, and Wi-Fi checks; no settings changed.")
     } catch {
         fputs("\(error)\n", stderr)
         exit(1)
@@ -352,6 +539,14 @@ if CommandLine.arguments.contains("--self-test") {
         fputs("\(error)\n", stderr)
         exit(1)
     }
+} else if CommandLine.arguments == [CommandLine.arguments[0], "--wifi-status"] {
+    let (state, name) = currentWiFiState()
+    let descriptions: [WiFiState: String] = [
+        .missing: "no Wi-Fi hardware found", .off: "turned off", .connected: "connected",
+        .otherNetwork: "idle; online through another network", .offline: "offline"
+    ]
+    print("Wi-Fi\(name.map { " (\($0))" } ?? ""): \(descriptions[state]!)")
+    print("Reconnect automatically: \(UserDefaults.standard.object(forKey: "reconnectWiFi") as? Bool ?? true ? "on" : "off")")
 } else if CommandLine.arguments == [CommandLine.arguments[0], "--enable-no-prompt"] {
     do {
         try runCommand("/usr/bin/osascript", ["-e", setupScript()])
@@ -408,7 +603,7 @@ if CommandLine.arguments.contains("--self-test") {
         exit(1)
     }
 } else if CommandLine.arguments.contains("-h") || CommandLine.arguments.contains("--help") {
-    print("LidSleep: native menu-bar sleep toggle.\nOptions: --status, --self-test, --set sleep|awake, --enable-no-prompt, --icon-preview DIRECTORY, --help\nSetup requests admin approval once; toggles never prompt.")
+    print("LidSleep: native menu-bar sleep toggle.\nOptions: --status, --wifi-status, --self-test, --set sleep|awake, --enable-no-prompt, --icon-preview DIRECTORY, --help\nSetup requests admin approval once; toggles never prompt.")
 } else if CommandLine.arguments.count > 1 {
     fputs("Unknown arguments. Use --help.\n", stderr)
     exit(2)
